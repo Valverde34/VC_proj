@@ -1,16 +1,19 @@
-# Algoritmo principal de contagem de flexoes
+# Algoritmo principal de contagem de flexoes, tem ML mas deve-se retirar
 import os
 import cv2
 import numpy as np
 import mediapipe as mp
 from collections import deque
+from ml_analyzer import MLMovementAnalyzer
+
+ml_analyzer = MLMovementAnalyzer()
 
 # escolher webcam ou vídeo
 # SOURCE = "webcam"  # Para usar a webcam
 SOURCE = "video"   # Para usar vídeo
 
 # Definir caminho:
-VIDEO_PATH = r"C:\VC_proj\src\Copy of push up 168.mp4"
+VIDEO_PATH = r"C:\VC_proj\src\Copy of push up 83.mp4"
 
 # Initialize MediaPipe Pose
 mp_drawing = mp.solutions.drawing_utils
@@ -130,7 +133,7 @@ def check_pushup_position(landmarks):
     except Exception:
         return False
 
-
+# Painel de UI
 def draw_ui(image, counter, stage, in_pushup_position, form_status, elbow_angle=0, source="VIDEO",
             thresholds=(90, 155), calib_active=False,
             good_reps=0, incomplete_reps=0, feedback_list=None, last_rep_feedback=""):
@@ -239,7 +242,7 @@ def draw_ui(image, counter, stage, in_pushup_position, form_status, elbow_angle=
     cv2.putText(image, f"SOURCE: {source}", (20,35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
  
     
-# ====== INICIALIZAR CAPTURA ======
+# INICIALIZAR CAPTURA
 if SOURCE == "webcam":
     print("[INFO] Usando WEBCAM")
     cap = cv2.VideoCapture(0)
@@ -464,23 +467,22 @@ while True:
                 # final da repetição
                 if good_form:
                     counter += 1
-                    # Avaliação de amplitude
-                    depth_ok = (rep_min_angle is not None) and (rep_min_angle <= (DOWN_THRESHOLD + DEPTH_TOLERANCE))
-
-                    top_reached = rep_max_angle if rep_max_angle is not None else elbow_angle
-                    lockout_ok = top_reached >= (UP_THRESHOLD - LOCKOUT_TOLERANCE)
                     
-                    if depth_ok and lockout_ok and hip_angle >= HIP_SAG_ANGLE_WARN:
+                    # ANÁLISE ML
+                    ml_result = ml_analyzer.analyze_rep(
+                        landmarks, elbow_angle, hip_angle,
+                        rep_min_angle, rep_max_angle, stage
+                    )
+                    
+                    # Usar resultado ML para feedback
+                    if ml_result['score'] >= 75:
                         good_reps += 1
-                        last_rep_feedback = "OK"
+                        last_rep_feedback = f"{ml_result['grade']} - {ml_result['quality']} ({int(ml_result['score'])})"
                     else:
-                        issues = []
-                        if not depth_ok: issues.append("INCOMPLETE DEPTH")
-                        if not lockout_ok: issues.append("INCOMPLETE LOCKOUT")
-                        if hip_angle < HIP_SAG_ANGLE_WARN: issues.append("HIP SAG")
-                        last_rep_feedback = " | ".join(issues)
                         incomplete_reps += 1
-                    # reset para próxima
+                        weak_points = ml_result['weak_points'][:2]  # Top 2 issues
+                        last_rep_feedback = f"{ml_result['grade']} - " + " | ".join(weak_points)
+                    
                     rep_min_angle = None
                     rep_max_angle = None
                     
@@ -546,3 +548,10 @@ pose.close()
 print(f"\n[INFO] Sessão finalizada!")
 print(f"[INFO] Total de repetições: {counter}")
 print(f"[INFO] Boas: {good_reps} | Incompletas: {incomplete_reps}")
+print(f"\n[INFO] ===== ANÁLISE ML =====")
+ml_report = ml_analyzer.get_session_report()
+print(f"[INFO] Taxa de sucesso: {ml_report['success_rate']:.1f}%")
+print(f"[INFO] Score médio: {ml_report['average_score']:.1f}/100")
+print(f"[INFO] Sugestões:")
+for sug in ml_report['suggestions']:
+    print(f"       {sug}")
