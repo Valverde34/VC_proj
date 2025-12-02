@@ -12,7 +12,7 @@ from collections import deque
 
 # ===== CONFIGURAÇÃO =====
 SOURCE = "video"  # "webcam" ou "video"
-VIDEO_PATH = r"C:\VC_proj\src\v_JumpingJack_g24_c02.mp4"
+VIDEO_PATH = r"C:\Uni\1_ano\1_semestre\VC\VC_proj\src\v_JumpingJack_g24_c02.mp4"
 
 # ===== INICIALIZAÇÃO MEDIAPIPE =====
 mp_drawing = mp.solutions.drawing_utils

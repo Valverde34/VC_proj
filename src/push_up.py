@@ -13,7 +13,7 @@ ml_analyzer = MLMovementAnalyzer()
 SOURCE = "video"   # Para usar vídeo
 
 # Definir caminho:
-VIDEO_PATH = r"C:\VC_proj\src\Copy of push up 83.mp4"
+VIDEO_PATH = r"C:\Uni\1_ano\1_semestre\VC\VC_proj\src\Copy of push up 83.mp4"
 
 # Initialize MediaPipe Pose
 mp_drawing = mp.solutions.drawing_utils

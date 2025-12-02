@@ -13,7 +13,7 @@ from collections import deque
 
 # ===== CONFIGURAÇÃO =====
 SOURCE = "video"  # "webcam" ou "video"
-VIDEO_PATH = r"C:\VC_proj\src\v_Lunges_g05_c02.mp4"
+VIDEO_PATH = r"C:\Uni\1_ano\1_semestre\VC\VC_proj\src\lunges1.mp4"
 
 # ===== INICIALIZAÇÃO MEDIAPIPE =====
 mp_drawing = mp.solutions.drawing_utils
@@ -29,15 +29,20 @@ pose = mp_pose.Pose(
 counter = 0
 stage = None  # "up" ou "down"
 current_leg = None  # "left" ou "right"
+pending_leg_change = None  # Perna candidata a mudança
+leg_change_confirmation_frames = 0  # Frames confirmando mudança
+MIN_LEG_CHANGE_FRAMES = 3  # 3 frames (~0.1s) para equilíbrio entre resposta e estabilidade
 form_status = "Unknown"
 in_position = False
+frames_since_last_rep = 0  # Anti-bounce: evitar contagens múltiplas
+MIN_FRAMES_BETWEEN_REPS = 15  # ~0.5s a 30fps
 
 # ===== THRESHOLDS ADAPTATIVOS =====
-USE_ADAPTIVE_THRESHOLDS = True
-KNEE_ANGLE_DOWN_THRESHOLD = 90   # Joelho flexionado (quanto menor, mais profundo)
-KNEE_ANGLE_UP_THRESHOLD = 160    # Joelho estendido
-HIP_ANGLE_DOWN_THRESHOLD = 100   # Quadril flexionado
-HIP_ANGLE_UP_THRESHOLD = 160     # Quadril estendido
+USE_ADAPTIVE_THRESHOLDS = False  # Desativado - thresholds fixos funcionam melhor para lunges
+KNEE_ANGLE_DOWN_THRESHOLD = 110   # Joelho flexionado - ajustado para valores reais observados (60-110°)
+KNEE_ANGLE_UP_THRESHOLD = 160     # Joelho estendido - quase totalmente esticado
+HIP_ANGLE_DOWN_THRESHOLD = 120    # Quadril flexionado (menos usado)
+HIP_ANGLE_UP_THRESHOLD = 145      # Quadril estendido (menos usado)
 
 # Estado de calibração
 calib_active = USE_ADAPTIVE_THRESHOLDS
@@ -62,14 +67,66 @@ right_knee_angle_history = deque(maxlen=10)
 
 
 def calculate_angle(a, b, c):
-    """Calcula ângulo entre 3 pontos"""
+    """
+    Calcula ângulo entre 3 pontos (a -> b -> c)
+    Para joelho: a=quadril, b=joelho, c=tornozelo
+    
+    Retorna o ângulo de flexão articular (0-180°):
+    - 180° = perna completamente reta
+    - 90° = joelho dobrado a 90°
+    - 0° = joelho completamente fechado
+    """
     a = np.array(a)
     b = np.array(b)
     c = np.array(c)
-    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
-    angle = np.abs(radians * 180.0 / np.pi)
-    if angle > 180.0:
-        angle = 360 - angle
+    
+    # Vetores partindo do ponto central (joelho)
+    ba = a - b  # Vetor do joelho para o quadril
+    bc = c - b  # Vetor do joelho para o tornozelo
+    
+    # Calcular ângulo usando produto escalar
+    # cos(θ) = (ba · bc) / (|ba| * |bc|)
+    dot_product = np.dot(ba, bc)
+    magnitude_ba = np.linalg.norm(ba)
+    magnitude_bc = np.linalg.norm(bc)
+    
+    # Evitar divisão por zero
+    if magnitude_ba == 0 or magnitude_bc == 0:
+        return 180.0
+    
+    cosine_angle = dot_product / (magnitude_ba * magnitude_bc)
+    
+    # Garantir que está no intervalo [-1, 1] por erros de precisão numérica
+    cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+    
+    # Calcular ângulo em graus
+    angle = np.degrees(np.arccos(cosine_angle))
+    
+    # CORREÇÃO UNIVERSAL: O ângulo do joelho deve estar sempre entre 0-180°
+    # onde 180° = perna reta e valores menores = mais flexão.
+    # 
+    # MediaPipe 3D pode retornar o ângulo ou seu complementar (180° - angle)
+    # dependendo da orientação da pessoa. Precisamos garantir consistência.
+    #
+    # Regra biomecânica: numa posição de lunge com joelho flexionado,
+    # o ângulo REAL está entre 60-120°. Se calcularmos <60°, é o complementar.
+    # Numa posição reta, o ângulo está entre 160-180°.
+    #
+    # Estratégia: se o ângulo calculado for muito pequeno (<90°) EM ALGUNS vídeos,
+    # mas noutros está correto, fazemos validação condicional baseada na geometria.
+    
+    if len(c) >= 2 and len(b) >= 2:
+        # Verificar posição relativa: ankle acima do knee indica possível inversão
+        ankle_above_knee = c[1] < b[1]
+        
+        # Se ankle está acima E ângulo < 90°, provavelmente é complementar
+        if ankle_above_knee and angle < 90:
+            angle = 180.0 - angle
+    
+    # Garantir que nunca retorna exatamente 0 (indica erro de cálculo)
+    if angle < 1.0:
+        return 1.0
+    
     return angle
 
 
@@ -123,90 +180,107 @@ def detect_camera_angle(landmarks):
 def check_lunge_position(landmarks):
     """
     Verifica se está em posição válida para lunge
-    Deve detectar corpo completo com pernas visíveis
+    Muito permissivo - aceita qualquer ângulo de câmera (frente/lado/atrás)
     """
     try:
         L = mp_pose.PoseLandmark
         
-        # Pontos essenciais para lunge
-        required_points = [
+        # Pontos MÍNIMOS necessários: quadris e joelhos
+        critical_points = [
             L.LEFT_HIP, L.RIGHT_HIP,
             L.LEFT_KNEE, L.RIGHT_KNEE,
-            L.LEFT_ANKLE, L.RIGHT_ANKLE,
-            L.LEFT_SHOULDER, L.RIGHT_SHOULDER
         ]
         
-        # Verificar visibilidade individual - MAIS PERMISSIVO
+        # Verificar visibilidade - MUITO permissivo (0.3 = 30%)
         visible_count = 0
-        for p in required_points:
-            if landmarks[p.value].visibility > 0.5:  # era 0.6
+        for p in critical_points:
+            if landmarks[p.value].visibility > 0.3:  # Baixado de 0.4
                 visible_count += 1
         
-        # Pelo menos 6 dos 8 pontos devem estar visíveis
-        if visible_count < 6:
+        # Precisa de pelo menos 3 dos 4 pontos
+        if visible_count < 3:
             return False
         
-        # Verificar se pernas estão no frame - MAIS PERMISSIVO
+        # Verificar se pelo menos UM joelho está minimamente visível
         left_knee = landmarks[L.LEFT_KNEE.value]
         right_knee = landmarks[L.RIGHT_KNEE.value]
-        left_ankle = landmarks[L.LEFT_ANKLE.value]
-        right_ankle = landmarks[L.RIGHT_ANKLE.value]
         
-        # Pelo menos 3 dos 4 pontos devem estar no frame
-        points_in_frame = 0
-        for point in [left_knee, right_knee, left_ankle, right_ankle]:
-            if 0.05 < point.y < 0.98:  # era 0.1 a 0.95 - MAIS MARGEM
-                points_in_frame += 1
-        
-        if points_in_frame < 3:
-            return False
-        
-        # Verificar altura mínima - MAIS PERMISSIVO
-        left_hip = landmarks[L.LEFT_HIP.value]
-        right_hip = landmarks[L.RIGHT_HIP.value]
-        
-        # Usar o quadril mais visível
-        if left_hip.visibility > right_hip.visibility:
-            hip_y = left_hip.y
-            ankle_y = left_ankle.y if left_ankle.visibility > 0.5 else right_ankle.y
-        else:
-            hip_y = right_hip.y
-            ankle_y = right_ankle.y if right_ankle.visibility > 0.5 else left_ankle.y
-        
-        vertical_span = abs(hip_y - ankle_y)
-        if vertical_span < 0.2:  # era 0.25 - MAIS PERMISSIVO
+        if left_knee.visibility < 0.3 and right_knee.visibility < 0.3:
             return False
         
         return True
         
     except Exception as e:
-        print(f"[DEBUG] Erro em check_lunge_position: {e}")
         return False
 
 
-def determine_working_leg(left_knee_angle, right_knee_angle, left_knee_hist, right_knee_hist):
+def determine_working_leg(landmarks, left_knee_angle, right_knee_angle):
     """
-    Determina qual perna está trabalhando (fazendo lunge)
-    A perna que trabalha tem maior variação de ângulo
-    """
-    # Calcular variação de cada perna
-    if len(left_knee_hist) >= 5 and len(right_knee_hist) >= 5:
-        left_variance = np.std(left_knee_hist)
-        right_variance = np.std(right_knee_hist)
-        
-        # A perna com maior variação está trabalhando
-        if left_variance > right_variance + 5:
-            return "left"
-        elif right_variance > left_variance + 5:
-            return "right"
+    Determina a Working Leg baseada na posição (quem está à frente)
+    usando um sistema de pontuação multi-critério.
     
-    # Se não houver histórico suficiente, usar perna mais flexionada
-    if left_knee_angle < right_knee_angle - 10:
+    Usa 3 critérios em ordem de prioridade:
+    1. Profundidade (Z-axis): perna mais perto da câmara
+    2. Verticalidade da canela: perna com canela mais vertical
+    3. Ângulo do joelho: apenas como fallback
+    """
+    L = mp_pose.PoseLandmark
+    
+    # Obter coordenadas Z (profundidade)
+    # MediaPipe Z: Valores menores = mais perto da câmara
+    left_knee_z = landmarks[L.LEFT_KNEE.value].z
+    right_knee_z = landmarks[L.RIGHT_KNEE.value].z
+    
+    # Obter coordenadas X para verificação de 'shin vertical'
+    left_knee_x = landmarks[L.LEFT_KNEE.value].x
+    left_ankle_x = landmarks[L.LEFT_ANKLE.value].x
+    right_knee_x = landmarks[L.RIGHT_KNEE.value].x
+    right_ankle_x = landmarks[L.RIGHT_ANKLE.value].x
+
+    # Sistema de pontuação: cada critério dá pontos
+    left_score = 0
+    right_score = 0
+
+    # 1. CRITÉRIO PRINCIPAL: Profundidade (peso 3)
+    # Threshold reduzido para 0.05 para maior sensibilidade
+    z_diff = abs(left_knee_z - right_knee_z)
+    if z_diff > 0.05:  # Só conta se houver diferença significativa
+        if left_knee_z < right_knee_z:
+            left_score += 3
+        else:
+            right_score += 3
+
+    # 2. CRITÉRIO SECUNDÁRIO: Verticalidade da Canela (peso 2)
+    # A perna da frente tem canela mais vertical
+    left_shin_verticality = abs(left_knee_x - left_ankle_x)
+    right_shin_verticality = abs(right_knee_x - right_ankle_x)
+    
+    shin_diff = abs(left_shin_verticality - right_shin_verticality)
+    if shin_diff > 0.03:  # Threshold reduzido para maior sensibilidade
+        if left_shin_verticality < right_shin_verticality:
+            left_score += 2
+        else:
+            right_score += 2
+
+    # 3. FALLBACK: Ângulo (peso 1)
+    # Perna mais flexionada (menor ângulo) com threshold aumentado
+    angle_diff = abs(left_knee_angle - right_knee_angle)
+    if angle_diff > 20:  # Reduzido de 30 para 20
+        if left_knee_angle < right_knee_angle:
+            left_score += 1
+        else:
+            right_score += 1
+    
+    # Decisão baseada em pontuação
+    # Requer pelo menos 1 ponto de diferença - mais responsivo
+    if left_score > right_score:
         return "left"
-    elif right_knee_angle < left_knee_angle - 10:
+    elif right_score > left_score:
         return "right"
     
+    # Se empate exato, mantém perna anterior (retorna None)
     return None
+
 
 
 def draw_ui(image, counter, stage, in_position, form_status,
@@ -219,32 +293,44 @@ def draw_ui(image, counter, stage, in_position, form_status,
         feedback_list = []
     h, w = image.shape[:2]
     
-    # Painel lateral
-    panel_width = 400
+    # Painel lateral - ajustável baseado na largura da imagem
+    # Mais estreito para vídeos onde a pessoa está muito perto
+    if w < 800:
+        panel_width = 250  # Muito estreito para vídeos pequenos
+    elif w < 1200:
+        panel_width = 300  # Estreito para vídeos médios
+    else:
+        panel_width = 400  # Largura normal
+    
     overlay = image.copy()
     cv2.rectangle(overlay, (w - panel_width, 0), (w, h), (40, 40, 40), -1)
     cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
     cv2.line(image, (w - panel_width, 0), (w - panel_width, h), (100, 100, 100), 3)
     
     y_offset = 60
-    x_margin = w - panel_width + 30
+    x_margin = w - panel_width + 20  # Margem mais pequena
+    
+    # Ajustar tamanhos de fonte baseado no tamanho do painel
+    title_scale = 0.8 if panel_width < 350 else 1.0
+    text_scale = 0.5 if panel_width < 350 else 0.6
+    number_scale = 1.2 if panel_width < 350 else 1.8
     
     # Título
-    cv2.putText(image, "LUNGE COUNTER", (x_margin, y_offset), cv2.FONT_HERSHEY_DUPLEX, 1.0, (255,255,255), 3)
-    cv2.line(image, (x_margin, y_offset + 10), (w - 30, y_offset + 10), (0,255,0), 2)
+    cv2.putText(image, "LUNGE COUNTER", (x_margin, y_offset), cv2.FONT_HERSHEY_DUPLEX, title_scale, (255,255,255), 2 if panel_width < 350 else 3)
+    cv2.line(image, (x_margin, y_offset + 10), (w - 20, y_offset + 10), (0,255,0), 2)
     
     # Ângulo da câmera
     y_offset += 40
     cam_colors = {"front": (0,255,0), "side": (0,165,255), "back": (255,100,0)}
     cam_color = cam_colors.get(camera_angle, (200,200,200))
     cv2.putText(image, f"VIEW: {camera_angle.upper()}", (x_margin, y_offset), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, cam_color, 2)
+                cv2.FONT_HERSHEY_SIMPLEX, text_scale, cam_color, 2)
     
     # Status adaptativo
-    y_offset += 35
+    y_offset += 30
     adapt_text = "ADAPTIVE: ON" if USE_ADAPTIVE_THRESHOLDS else "ADAPTIVE: OFF"
     adapt_color = (0,255,0) if USE_ADAPTIVE_THRESHOLDS else (0,0,255)
-    cv2.putText(image, adapt_text, (x_margin, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, adapt_color, 2)
+    cv2.putText(image, adapt_text, (x_margin, y_offset), cv2.FONT_HERSHEY_SIMPLEX, text_scale, adapt_color, 2)
     
     if USE_ADAPTIVE_THRESHOLDS:
         y_offset += 28
@@ -253,10 +339,10 @@ def draw_ui(image, counter, stage, in_position, form_status,
         cv2.putText(image, calib_text, (x_margin, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, calib_color, 2)
     
     # Contador
-    y_offset += 80
-    cv2.rectangle(image, (x_margin - 15, y_offset - 50), (w - 30, y_offset + 30), (0,100,255), -1)
-    cv2.putText(image, "REPS", (x_margin, y_offset - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-    cv2.putText(image, str(counter), (x_margin, y_offset + 25), cv2.FONT_HERSHEY_DUPLEX, 1.8, (255,255,255), 4)
+    y_offset += 60
+    cv2.rectangle(image, (x_margin - 10, y_offset - 40), (w - 20, y_offset + 25), (0,100,255), -1)
+    cv2.putText(image, "REPS", (x_margin, y_offset - 15), cv2.FONT_HERSHEY_SIMPLEX, text_scale * 1.2, (255,255,255), 2)
+    cv2.putText(image, str(counter), (x_margin, y_offset + 20), cv2.FONT_HERSHEY_DUPLEX, number_scale, (255,255,255), 3 if panel_width < 350 else 4)
     
     # Perna atual
     y_offset += 70
@@ -423,87 +509,125 @@ while True:
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     results = pose.process(image_rgb)
     
+    # Incrementar contador de frames desde última rep
+    frames_since_last_rep += 1
+    
     knee_angle = 0
     hip_angle = 0
     feedback_list = []
     camera_angle = "front"
+    display_stage = stage if stage else "up"  # Default para display
     
     if results.pose_landmarks:
         landmarks = results.pose_landmarks.landmark
         in_position = check_lunge_position(landmarks)
         camera_angle = detect_camera_angle(landmarks)
         
-        # DEBUG: Mostrar visibilidade dos pontos
-        L = mp_pose.PoseLandmark
-        vis_avg = np.mean([
-            landmarks[L.LEFT_KNEE.value].visibility,
-            landmarks[L.RIGHT_KNEE.value].visibility,
-            landmarks[L.LEFT_HIP.value].visibility,
-            landmarks[L.RIGHT_HIP.value].visibility
-        ])
-        print(f"[DEBUG] Visibilidade média: {vis_avg:.2f} | In Position: {in_position}")
+        # Tentar obter landmarks 3D (World Landmarks) para cálculo preciso de ângulos
+        # Isto elimina distorção de perspectiva da câmara
+        if results.pose_world_landmarks:
+            landmarks_3d = results.pose_world_landmarks.landmark
+            use_3d = True
+        else:
+            # Fallback para 2D se 3D não disponível
+            landmarks_3d = landmarks
+            use_3d = False
         
-        # Calcular ângulos de ambas as pernas
+        # DEBUG: Mostrar visibilidade dos pontos (comentado para menos spam)
+        # L = mp_pose.PoseLandmark
+        # vis_avg = np.mean([
+        #     landmarks[L.LEFT_KNEE.value].visibility,
+        #     landmarks[L.RIGHT_KNEE.value].visibility,
+        #     landmarks[L.LEFT_HIP.value].visibility,
+        #     landmarks[L.RIGHT_HIP.value].visibility
+        # ])
+        # print(f"[DEBUG] Visibilidade média: {vis_avg:.2f} | In Position: {in_position}")
+        
+        L = mp_pose.PoseLandmark
+        
+        # Extrair pontos 3D para cálculo de ângulos (coordenadas em metros, sem distorção)
+        # Perna Esquerda
+        l_hip_3d = [landmarks_3d[L.LEFT_HIP.value].x, landmarks_3d[L.LEFT_HIP.value].y, landmarks_3d[L.LEFT_HIP.value].z]
+        l_knee_3d = [landmarks_3d[L.LEFT_KNEE.value].x, landmarks_3d[L.LEFT_KNEE.value].y, landmarks_3d[L.LEFT_KNEE.value].z]
+        l_ankle_3d = [landmarks_3d[L.LEFT_ANKLE.value].x, landmarks_3d[L.LEFT_ANKLE.value].y, landmarks_3d[L.LEFT_ANKLE.value].z]
+        l_shoulder_3d = [landmarks_3d[L.LEFT_SHOULDER.value].x, landmarks_3d[L.LEFT_SHOULDER.value].y, landmarks_3d[L.LEFT_SHOULDER.value].z]
+        
+        # Perna Direita
+        r_hip_3d = [landmarks_3d[L.RIGHT_HIP.value].x, landmarks_3d[L.RIGHT_HIP.value].y, landmarks_3d[L.RIGHT_HIP.value].z]
+        r_knee_3d = [landmarks_3d[L.RIGHT_KNEE.value].x, landmarks_3d[L.RIGHT_KNEE.value].y, landmarks_3d[L.RIGHT_KNEE.value].z]
+        r_ankle_3d = [landmarks_3d[L.RIGHT_ANKLE.value].x, landmarks_3d[L.RIGHT_ANKLE.value].y, landmarks_3d[L.RIGHT_ANKLE.value].z]
+        r_shoulder_3d = [landmarks_3d[L.RIGHT_SHOULDER.value].x, landmarks_3d[L.RIGHT_SHOULDER.value].y, landmarks_3d[L.RIGHT_SHOULDER.value].z]
+        
+        # Calcular ângulos usando coordenadas 3D (sem distorção de perspectiva)
+        left_knee_angle = calculate_angle(l_hip_3d, l_knee_3d, l_ankle_3d)
+        right_knee_angle = calculate_angle(r_hip_3d, r_knee_3d, r_ankle_3d)
+        
+        # DEBUG: Mostrar ângulos calculados (descomentar se necessário)
+        # print(f"[DEBUG] L_knee: {left_knee_angle:.1f}° | R_knee: {right_knee_angle:.1f}° | Use3D: {use_3d}")
+        
+        # Ângulos dos quadris
+        left_hip_angle = calculate_angle(l_shoulder_3d, l_hip_3d, l_knee_3d)
+        right_hip_angle = calculate_angle(r_shoulder_3d, r_hip_3d, r_knee_3d)
+        
+        # Manter referências 2D para verificações de UI
         left_hip = landmarks[L.LEFT_HIP.value]
         left_knee = landmarks[L.LEFT_KNEE.value]
         left_ankle = landmarks[L.LEFT_ANKLE.value]
-        left_shoulder = landmarks[L.LEFT_SHOULDER.value]
-        
         right_hip = landmarks[L.RIGHT_HIP.value]
         right_knee = landmarks[L.RIGHT_KNEE.value]
         right_ankle = landmarks[L.RIGHT_ANKLE.value]
-        right_shoulder = landmarks[L.RIGHT_SHOULDER.value]
-        
-        # Ângulos dos joelhos
-        left_knee_angle = calculate_angle(
-            [left_hip.x, left_hip.y],
-            [left_knee.x, left_knee.y],
-            [left_ankle.x, left_ankle.y]
-        )
-        
-        right_knee_angle = calculate_angle(
-            [right_hip.x, right_hip.y],
-            [right_knee.x, right_knee.y],
-            [right_ankle.x, right_ankle.y]
-        )
-        
-        # Ângulos dos quadris
-        left_hip_angle = calculate_angle(
-            [left_shoulder.x, left_shoulder.y],
-            [left_hip.x, left_hip.y],
-            [left_knee.x, left_knee.y]
-        )
-        
-        right_hip_angle = calculate_angle(
-            [right_shoulder.x, right_shoulder.y],
-            [right_hip.x, right_hip.y],
-            [right_knee.x, right_knee.y]
-        )
         
         # Adicionar ao histórico
         left_knee_angle_history.append(left_knee_angle)
         right_knee_angle_history.append(right_knee_angle)
         
         # Determinar qual perna está trabalhando
-        working_leg = determine_working_leg(left_knee_angle, right_knee_angle, 
-                                           left_knee_angle_history, right_knee_angle_history)
-        
-        if working_leg:
-            current_leg = working_leg
+        # SÓ permitir mudança se estiver em estado UP (entre reps)
+        if stage != "down":
+            working_leg = determine_working_leg(landmarks, left_knee_angle, right_knee_angle)
             
-            # Usar ângulos da perna que trabalha
+            if working_leg:
+                # Mecanismo de confirmação: requer MIN_LEG_CHANGE_FRAMES frames consecutivos
+                if working_leg != current_leg:
+                    if working_leg == pending_leg_change:
+                        leg_change_confirmation_frames += 1
+                        if leg_change_confirmation_frames >= MIN_LEG_CHANGE_FRAMES:
+                            current_leg = working_leg
+                            leg_change_confirmation_frames = 0
+                            pending_leg_change = None
+                    else:
+                        pending_leg_change = working_leg
+                        leg_change_confirmation_frames = 1
+                else:
+                    # Se voltou à perna atual, resetar contador
+                    pending_leg_change = None
+                    leg_change_confirmation_frames = 0
+        
+        # Usar o ângulo da WORKING LEG (perna que está à frente fazendo o lunge)
+        # NÃO usar sempre o menor ângulo, pois a perna de trás pode estar mais fechada
+        if left_knee_angle > 10 and right_knee_angle > 10:
             if current_leg == "left":
+                # Usar ângulos da perna esquerda (working leg)
                 raw_knee_angle = left_knee_angle
                 raw_hip_angle = left_hip_angle
-            else:
+            elif current_leg == "right":
+                # Usar ângulos da perna direita (working leg)
                 raw_knee_angle = right_knee_angle
                 raw_hip_angle = right_hip_angle
+            else:
+                # Fallback: primeiros frames antes de determinar working leg
+                # Usar o menor ângulo temporariamente
+                raw_knee_angle = min(left_knee_angle, right_knee_angle)
+                raw_hip_angle = left_hip_angle if left_knee_angle < right_knee_angle else right_hip_angle
             
-            knee_angle_buffer.append(raw_knee_angle)
-            hip_angle_buffer.append(raw_hip_angle)
-            
-            knee_angle = np.mean(knee_angle_buffer)
-            hip_angle = np.mean(hip_angle_buffer)
+            # Validar ângulos antes de adicionar ao buffer
+            if raw_knee_angle > 10 and raw_hip_angle > 10:
+                knee_angle_buffer.append(raw_knee_angle)
+                hip_angle_buffer.append(raw_hip_angle)
+                
+                if len(knee_angle_buffer) > 0:
+                    knee_angle = np.mean(knee_angle_buffer)
+                    hip_angle = np.mean(hip_angle_buffer)
 
         # Análise de forma
         if not in_position:
@@ -515,7 +639,32 @@ while True:
             form_status = "Bend hip more"
             feedback_list.append("BEND HIP")
         else:
-            form_status = "Good form"
+            # Verificar segurança: canela deve estar vertical (joelho não deve passar muito o pé)
+            # Perna mais flexionada é a que está trabalhando
+            if left_knee_angle < right_knee_angle:
+                knee_x = left_knee.x
+                ankle_x = left_ankle.x
+            else:
+                knee_x = right_knee.x
+                ankle_x = right_ankle.x
+            
+            shin_horizontal_offset = abs(knee_x - ankle_x)
+            if shin_horizontal_offset > 0.15 and stage == "down":
+                form_status = "Knee too forward"
+                feedback_list.append("KEEP SHIN VERTICAL")
+            else:
+                form_status = "Good form"
+        
+        # Determinar display_stage baseado no ângulo ATUAL (não nas transições)
+        # Para mostrar o estado real no UI
+        display_stage = stage if stage else "up"
+        if knee_angle > 0:  # Se temos ângulo válido
+            if knee_angle < 130:
+                display_stage = "down"
+            elif knee_angle > 145:
+                display_stage = "up"
+        else:
+            display_stage = stage if stage else "up"
 
         if in_position and current_leg:
             # Tracking de métricas
@@ -530,11 +679,13 @@ while True:
 
             # Calibração adaptativa
             if USE_ADAPTIVE_THRESHOLDS and calib_active:
-                calib_frames += 1
-                knee_angle_min = min(knee_angle_min, knee_angle)
-                knee_angle_max = max(knee_angle_max, knee_angle)
-                hip_angle_min = min(hip_angle_min, hip_angle)
-                hip_angle_max = max(hip_angle_max, hip_angle)
+                # Só calibrar com ângulos válidos (evitar contaminar com zeros)
+                if knee_angle > 20 and hip_angle > 20:
+                    calib_frames += 1
+                    knee_angle_min = min(knee_angle_min, knee_angle)
+                    knee_angle_max = max(knee_angle_max, knee_angle)
+                    hip_angle_min = min(hip_angle_min, hip_angle)
+                    hip_angle_max = max(hip_angle_max, hip_angle)
 
                 if calib_frames >= CALIB_MIN_FRAMES:
                     if (knee_angle_max - knee_angle_min) >= 40:
@@ -561,19 +712,24 @@ while True:
             hip_up_condition = hip_angle > HIP_ANGLE_UP_THRESHOLD
 
             # UP -> DOWN (descendo no lunge)
-            if stage == "up" and knee_down_condition and hip_down_condition:
+            # Critério principal: joelho flexionado. Quadril é secundário
+            if stage == "up" and knee_down_condition and frames_since_last_rep > MIN_FRAMES_BETWEEN_REPS:
                 stage = "down"
-                print(f"[INFO] ✓ Estado DOWN detectado! Joelho: {knee_angle:.1f}°")
+                print(f"[INFO] ✓ Estado DOWN detectado! Joelho: {knee_angle:.1f}° | Quadril: {hip_angle:.1f}°")
 
             # DOWN -> UP (subindo - rep completa)
-            elif stage == "down" and knee_up_condition and hip_up_condition:
+            # Critério principal: joelho estendido
+            elif stage == "down" and knee_up_condition and frames_since_last_rep > MIN_FRAMES_BETWEEN_REPS:
                 stage = "up"
                 counter += 1
+                frames_since_last_rep = 0  # Reset contador
                 
                 # Avaliar qualidade
-                depth_ok = rep_min_knee_angle is not None and rep_min_knee_angle <= (KNEE_ANGLE_DOWN_THRESHOLD + 20)
+                # Com threshold de 110°, permitir +20° de margem
+                depth_ok = rep_min_knee_angle is not None and rep_min_knee_angle <= 130
                 hip_ok = rep_min_hip_angle is not None and rep_min_hip_angle <= (HIP_ANGLE_DOWN_THRESHOLD + 20)
-                range_ok = (rep_max_knee_angle - rep_min_knee_angle) >= 40
+                # Range mínimo: ~50° (de ~60-110° para ~160°+)
+                range_ok = (rep_max_knee_angle - rep_min_knee_angle) >= 50
                 
                 if depth_ok and hip_ok and range_ok:
                     good_reps += 1
@@ -595,6 +751,12 @@ while True:
                 rep_min_knee_angle = None
                 rep_max_knee_angle = None
                 rep_min_hip_angle = None
+                
+                # Limpar histórico para permitir mudança de perna
+                left_knee_angle_history.clear()
+                right_knee_angle_history.clear()
+                knee_angle_buffer.clear()
+                hip_angle_buffer.clear()
 
         # Desenhar skeleton
         mp_drawing.draw_landmarks(
@@ -608,7 +770,7 @@ while True:
     # Desenhar UI
     source_text = "WEBCAM" if SOURCE == "webcam" else "VIDEO"
     draw_ui(
-        image, counter, stage, in_position, form_status,
+        image, counter, display_stage, in_position, form_status,
         knee_angle, hip_angle, current_leg, camera_angle,
         source_text,
         thresholds=(KNEE_ANGLE_DOWN_THRESHOLD, KNEE_ANGLE_UP_THRESHOLD),
@@ -641,6 +803,7 @@ while True:
         rep_min_knee_angle = None
         rep_max_knee_angle = None
         rep_min_hip_angle = None
+        frames_since_last_rep = 0
         left_knee_angle_history.clear()
         right_knee_angle_history.clear()
         print("[INFO] Contador resetado!")
