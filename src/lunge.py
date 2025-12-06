@@ -13,7 +13,7 @@ from collections import deque
 
 # ===== CONFIGURAÇÃO =====
 SOURCE = "video"  # "webcam" ou "video"
-VIDEO_PATH = r"C:\Uni\1_ano\1_semestre\VC\VC_proj\src\lunges4.mp4"
+VIDEO_PATH = r"C:\Uni\1_ano\1_semestre\VC\VC_proj\src\lunges3.mp4"
 
 # ===== INICIALIZAÇÃO MEDIAPIPE =====
 mp_drawing = mp.solutions.drawing_utils
@@ -31,7 +31,7 @@ stage = None  # "up" ou "down"
 current_leg = None  # "left" ou "right"
 pending_leg_change = None  # Perna candidata a mudança
 leg_change_confirmation_frames = 0  # Frames confirmando mudança
-MIN_LEG_CHANGE_FRAMES = 3  # 3 frames (~0.1s) para equilíbrio entre resposta e estabilidade
+MIN_LEG_CHANGE_FRAMES = 2  # Frames necessários para confirmar mudança de perna
 form_status = "Unknown"
 in_position = False
 frames_since_last_rep = 0  # Anti-bounce: evitar contagens múltiplas
@@ -216,69 +216,60 @@ def check_lunge_position(landmarks):
 
 def determine_working_leg(landmarks, left_knee_angle, right_knee_angle):
     """
-    Determina a Working Leg baseada na posição (quem está à frente)
-    usando um sistema de pontuação multi-critério.
-    
-    Usa 3 critérios em ordem de prioridade:
-    1. Profundidade (Z-axis): perna mais perto da câmara
-    2. Verticalidade da canela: perna com canela mais vertical
-    3. Ângulo do joelho: apenas como fallback
+    Determina a Working Leg.
+    Correção Rep 4: Se houver grande diferença de ângulo, essa perna ganha imediatamente.
     """
     L = mp_pose.PoseLandmark
     
-    # Obter coordenadas Z (profundidade)
-    # MediaPipe Z: Valores menores = mais perto da câmara
-    left_knee_z = landmarks[L.LEFT_KNEE.value].z
-    right_knee_z = landmarks[L.RIGHT_KNEE.value].z
+    # Coordenadas
+    left_knee = landmarks[L.LEFT_KNEE.value]
+    left_ankle = landmarks[L.LEFT_ANKLE.value]
+    right_knee = landmarks[L.RIGHT_KNEE.value]
+    right_ankle = landmarks[L.RIGHT_ANKLE.value]
     
-    # Obter coordenadas X para verificação de 'shin vertical'
-    left_knee_x = landmarks[L.LEFT_KNEE.value].x
-    left_ankle_x = landmarks[L.LEFT_ANKLE.value].x
-    right_knee_x = landmarks[L.RIGHT_KNEE.value].x
-    right_ankle_x = landmarks[L.RIGHT_ANKLE.value].x
-
-    # Sistema de pontuação: cada critério dá pontos
     left_score = 0
     right_score = 0
 
-    # 1. CRITÉRIO PRINCIPAL: Profundidade (peso 3)
-    # Threshold reduzido para 0.05 para maior sensibilidade
-    z_diff = abs(left_knee_z - right_knee_z)
-    if z_diff > 0.05:  # Só conta se houver diferença significativa
-        if left_knee_z < right_knee_z:
-            left_score += 3
+    # 1. CRITÉRIO SUPREMO: Diferença de Ângulo (Peso 10)
+    # Se uma perna está dobrada (90°) e a outra esticada (160°), não há dúvida.
+    # Isto resolve reps rápidas ou rasas onde a verticalidade falha.
+    if abs(left_knee_angle - right_knee_angle) > 30:
+        if left_knee_angle < right_knee_angle:
+            left_score += 10
         else:
-            right_score += 3
-
-    # 2. CRITÉRIO SECUNDÁRIO: Verticalidade da Canela (peso 2)
-    # A perna da frente tem canela mais vertical
-    left_shin_verticality = abs(left_knee_x - left_ankle_x)
-    right_shin_verticality = abs(right_knee_x - right_ankle_x)
+            right_score += 10
     
-    shin_diff = abs(left_shin_verticality - right_shin_verticality)
-    if shin_diff > 0.03:  # Threshold reduzido para maior sensibilidade
-        if left_shin_verticality < right_shin_verticality:
+    # 2. CRITÉRIO PRINCIPAL: Verticalidade da Canela (Peso 5)
+    # Para quando os ângulos são similares (início do movimento)
+    left_shin_horiz_dist = abs(left_knee.x - left_ankle.x)
+    right_shin_horiz_dist = abs(right_knee.x - right_ankle.x)
+    
+    if abs(left_shin_horiz_dist - right_shin_horiz_dist) > 0.02:
+        if left_shin_horiz_dist < right_shin_horiz_dist:
+            left_score += 5
+        else:
+            right_score += 5
+
+    # 3. CRITÉRIO AUXILIAR: Altura do Joelho (Peso 2)
+    # Perna da frente (Working) tem o joelho mais alto (menor Y)
+    if abs(left_knee.y - right_knee.y) > 0.05:
+        if left_knee.y < right_knee.y: 
             left_score += 2
         else:
             right_score += 2
 
-    # 3. FALLBACK: Ângulo (peso 1)
-    # Perna mais flexionada (menor ângulo) com threshold aumentado
-    angle_diff = abs(left_knee_angle - right_knee_angle)
-    if angle_diff > 20:  # Reduzido de 30 para 20
-        if left_knee_angle < right_knee_angle:
+    # 4. Desempate Z (Peso 1)
+    if abs(left_knee.z - right_knee.z) > 0.1: 
+        if left_knee.z < right_knee.z:
             left_score += 1
         else:
             right_score += 1
     
-    # Decisão baseada em pontuação
-    # Requer pelo menos 1 ponto de diferença - mais responsivo
     if left_score > right_score:
         return "left"
     elif right_score > left_score:
         return "right"
     
-    # Se empate exato, mantém perna anterior (retorna None)
     return None
 
 
@@ -582,26 +573,27 @@ while True:
         right_knee_angle_history.append(right_knee_angle)
         
         # Determinar qual perna está trabalhando
-        # SÓ permitir mudança se estiver em estado UP (entre reps)
-        if stage != "down":
-            working_leg = determine_working_leg(landmarks, left_knee_angle, right_knee_angle)
-            
-            if working_leg:
-                # Mecanismo de confirmação: requer MIN_LEG_CHANGE_FRAMES frames consecutivos
-                if working_leg != current_leg:
-                    if working_leg == pending_leg_change:
-                        leg_change_confirmation_frames += 1
-                        if leg_change_confirmation_frames >= MIN_LEG_CHANGE_FRAMES:
-                            current_leg = working_leg
-                            leg_change_confirmation_frames = 0
-                            pending_leg_change = None
-                    else:
-                        pending_leg_change = working_leg
-                        leg_change_confirmation_frames = 1
+        # PERMITIR SEMPRE a verificação. Se a perna estiver errada, o sistema
+        # corrige mesmo durante o movimento (protegido por confirmação de 2 frames)
+        working_leg = determine_working_leg(landmarks, left_knee_angle, right_knee_angle)
+        
+        if working_leg:
+            # Mecanismo de confirmação: requer MIN_LEG_CHANGE_FRAMES frames consecutivos
+            if working_leg != current_leg:
+                if working_leg == pending_leg_change:
+                    leg_change_confirmation_frames += 1
+                    if leg_change_confirmation_frames >= MIN_LEG_CHANGE_FRAMES:
+                        current_leg = working_leg
+                        leg_change_confirmation_frames = 0
+                        pending_leg_change = None
+                        print(f"[INFO] Working leg: {current_leg.upper()}")
                 else:
-                    # Se voltou à perna atual, resetar contador
-                    pending_leg_change = None
-                    leg_change_confirmation_frames = 0
+                    pending_leg_change = working_leg
+                    leg_change_confirmation_frames = 1
+            else:
+                # Se voltou à perna atual, resetar contador
+                pending_leg_change = None
+                leg_change_confirmation_frames = 0
         
         # Usar o ângulo da WORKING LEG (perna que está à frente fazendo o lunge)
         # NÃO usar sempre o menor ângulo, pois a perna de trás pode estar mais fechada
@@ -724,17 +716,25 @@ while True:
                 counter += 1
                 frames_since_last_rep = 0  # Reset contador
                 
+                # Preparar mensagem segura sobre current_leg ANTES do reset
+                leg_for_print = current_leg.upper() if current_leg else "UNKNOWN"
+                
+                # Forçar re-detecção da working leg no próximo ciclo
+                current_leg = None
+                pending_leg_change = None
+                leg_change_confirmation_frames = 0
+                
                 # Avaliar qualidade
                 # Com threshold de 110°, permitir +20° de margem
                 depth_ok = rep_min_knee_angle is not None and rep_min_knee_angle <= 130
                 hip_ok = rep_min_hip_angle is not None and rep_min_hip_angle <= (HIP_ANGLE_DOWN_THRESHOLD + 20)
                 # Range mínimo: ~50° (de ~60-110° para ~160°+)
-                range_ok = (rep_max_knee_angle - rep_min_knee_angle) >= 50
+                range_ok = (rep_max_knee_angle - rep_min_knee_angle) >= 50 if rep_min_knee_angle is not None and rep_max_knee_angle is not None else False
                 
                 if depth_ok and hip_ok and range_ok:
                     good_reps += 1
                     last_rep_feedback = "GOOD"
-                    print(f"[INFO] ✓ REP #{counter} ({current_leg.upper()}) - BOA!")
+                    print(f"[INFO] ✓ REP #{counter} ({leg_for_print}) - BOA!")
                 else:
                     incomplete_reps += 1
                     issues = []
@@ -745,7 +745,7 @@ while True:
                     if not range_ok:
                         issues.append("RANGE")
                     last_rep_feedback = "INCOMPLETE - " + " | ".join(issues)
-                    print(f"[WARN] ✗ REP #{counter} ({current_leg.upper()}) - INCOMPLETA: {' | '.join(issues)}")
+                    print(f"[WARN] ✗ REP #{counter} ({leg_for_print}) - INCOMPLETA: {' | '.join(issues)}")
                 
                 # Reset tracking
                 rep_min_knee_angle = None
@@ -797,6 +797,8 @@ while True:
         counter = 0
         stage = None
         current_leg = None
+        pending_leg_change = None  # Limpar pending também
+        leg_change_confirmation_frames = 0
         good_reps = 0
         incomplete_reps = 0
         last_rep_feedback = ""
@@ -806,6 +808,8 @@ while True:
         frames_since_last_rep = 0
         left_knee_angle_history.clear()
         right_knee_angle_history.clear()
+        knee_angle_buffer.clear()  # Limpar buffer de joelho
+        hip_angle_buffer.clear()   # Limpar buffer de quadril
         print("[INFO] Contador resetado!")
     elif key == ord('c'):
         calib_active = True
