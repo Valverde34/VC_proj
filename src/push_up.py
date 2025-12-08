@@ -1,19 +1,16 @@
-# Algoritmo principal de contagem de flexoes, tem ML mas deve-se retirar
+# Algoritmo principal de contagem de flexoes
 import os
 import cv2
 import numpy as np
 import mediapipe as mp
 from collections import deque
-from ml_analyzer import MLMovementAnalyzer
-
-ml_analyzer = MLMovementAnalyzer()
 
 # escolher webcam ou vídeo
 # SOURCE = "webcam"  # Para usar a webcam
 SOURCE = "video"   # Para usar vídeo
 
 # Definir caminho:
-VIDEO_PATH = r"C:\Uni\1_ano\1_semestre\VC\VC_proj\src\Copy of push up 83.mp4"
+VIDEO_PATH = r"C:\VC_proj\src\Copy of push up 83.mp4"
 
 # Initialize MediaPipe Pose
 mp_drawing = mp.solutions.drawing_utils
@@ -468,20 +465,21 @@ while True:
                 if good_form:
                     counter += 1
                     
-                    # ANÁLISE ML
-                    ml_result = ml_analyzer.analyze_rep(
-                        landmarks, elbow_angle, hip_angle,
-                        rep_min_angle, rep_max_angle, stage
-                    )
+                    # Análise simples baseada em ângulos e forma
+                    depth_ok = rep_min_angle is not None and rep_min_angle <= (DOWN_THRESHOLD + DEPTH_TOLERANCE)
+                    lockout_ok = rep_max_angle is not None and rep_max_angle >= (UP_THRESHOLD - LOCKOUT_TOLERANCE)
                     
-                    # Usar resultado ML para feedback
-                    if ml_result['score'] >= 75:
+                    if depth_ok and lockout_ok:
                         good_reps += 1
-                        last_rep_feedback = f"{ml_result['grade']} - {ml_result['quality']} ({int(ml_result['score'])})"
+                        last_rep_feedback = "GOOD REP"
                     else:
                         incomplete_reps += 1
-                        weak_points = ml_result['weak_points'][:2]  # Top 2 issues
-                        last_rep_feedback = f"{ml_result['grade']} - " + " | ".join(weak_points)
+                        issues = []
+                        if not depth_ok:
+                            issues.append("INCOMPLETE DEPTH")
+                        if not lockout_ok:
+                            issues.append("NO LOCKOUT")
+                        last_rep_feedback = " | ".join(issues)
                     
                     rep_min_angle = None
                     rep_max_angle = None
@@ -548,10 +546,3 @@ pose.close()
 print(f"\n[INFO] Sessão finalizada!")
 print(f"[INFO] Total de repetições: {counter}")
 print(f"[INFO] Boas: {good_reps} | Incompletas: {incomplete_reps}")
-print(f"\n[INFO] ===== ANÁLISE ML =====")
-ml_report = ml_analyzer.get_session_report()
-print(f"[INFO] Taxa de sucesso: {ml_report['success_rate']:.1f}%")
-print(f"[INFO] Score médio: {ml_report['average_score']:.1f}/100")
-print(f"[INFO] Sugestões:")
-for sug in ml_report['suggestions']:
-    print(f"       {sug}")
